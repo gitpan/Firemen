@@ -1,0 +1,626 @@
+#!/usr/bin/perl
+######################
+#
+#    Copyright (C) 2011  TU Clausthal, Institut für Maschinenwesen, Joachim Langenbach
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+######################
+
+# Pod::Weaver infos
+# PODNAME: fm_create_help
+# ABSTRACT: Walks through an installation and tries to extract all options with informations into a database
+
+use strict;
+use POSIX;
+use warnings;
+use Getopt::Long;
+use Archive::Zip qw/ :ERROR_CODES :CONSTANTS/;
+use HTML::TreeBuilder;
+use Tie::File;
+use Term::ProgressBar;
+use DBI;
+#use utf8;
+use File::Find;
+use CAD::Firemen;
+use CAD::Firemen::Common qw(
+  getInstallationPath
+  getInstallationConfigCdb
+  :PRINTING
+  strip
+  sharedDir
+  dbConnect
+  buildStatistic
+);
+use CAD::Firemen::Load qw(loadCDB);
+
+
+sub help {
+  print "Usage: fm_create_help [options] [PATH_TO_INSTALLATION]\n";
+  print "\n";
+  print "Options:\n";
+  print " --help             -h   Prints this help.\n";
+  print " --version               Prints current version.\n";
+  print " --verbose          -v   The verbose level. 0 - least output, 2 most output (Default: 0).\n";
+  print " --output           -o   Optional filepath to store the created data.\n";
+  print " --locale           -l   The locale which should be used (Default en_US).\n";
+  print " --crossfire        -c   Store the output in the format of Crossfire. Set file with --output.\n";
+  print "\n";
+  print "If no PATH_TO_INSTALLATION is given, it tries to figure out the correct installation with help of \$ENV{PATH}.\n";
+}
+
+sub getChildDivs {
+  my $parent = shift;
+  my @results = ();
+
+  if(!defined($parent) || (ref($parent) ne "HTML::Element")){
+    return @results;
+  }
+
+  foreach my $elem ($parent->content_list()){
+    if(ref($elem) ne "HTML::Element"){
+      next;
+    }
+    if($elem->tag() eq "div"){
+      push(@results, $elem);
+    }
+  }
+  return @results;
+}
+
+our $locale = "en_US";
+our $zipUrl = "";
+our $tocUrl = "";
+sub findUrls{
+  my $file = $File::Find::name;
+  my $regex = "(?:\|/)(?:pma|proe)_help_". substr($locale, 0, 2) .".zip\$";
+  if(($zipUrl eq "") && ($file =~ m/$regex/i)){
+    $zipUrl = $file;
+    testPassed("Found help archive (". $zipUrl .")");
+  }
+  else{
+    $regex = "toc/". $locale .".xml\$";
+    if(($tocUrl eq "") && ($file =~ m/$regex/)){
+      $tocUrl = $file;
+      testPassed("Found help toc (". $tocUrl .")");
+    }
+  }
+}
+
+my $showVersion = 0;
+my $help = 0;
+my $verbose = 0;
+my $outputFile = "";
+my $crossfire = 0;
+
+Getopt::Long::Configure ("bundling");
+GetOptions(
+  'version' => \$showVersion,
+  'help|h' => \$help,
+  'verbose|v:i' => \$verbose,
+  'output|o:s' => \$outputFile,
+  'locale|l:s' => \$locale,
+  'crossfire|c' => \$crossfire
+);
+
+if($help){
+  help();
+  exit 0;
+}
+
+if($showVersion){
+  CAD::Firemen::printVersion();
+}
+
+my $structUrl = shift;
+
+if(!defined($structUrl)){
+  $structUrl = getInstallationPath();
+}
+
+if(!defined($structUrl) || $structUrl eq ""){
+  help();
+  exit 1;
+}
+
+if($locale !~ m/[a-z]{2}_[A-Z]{2}/){
+  print "Please specify a valid locale like en_US\n";
+  help();
+  exit 1;
+}
+
+if($crossfire && $outputFile eq ""){
+  print "Please specify an output file with help of --output\n";
+  help();
+  exit 1;
+}
+
+# get most upper folder (root folder) of creo or proe
+my $rootUrl = $structUrl;
+$rootUrl =~ s/^(.+(?:creo|proe)[^(?:\\|\/)]+).{0,}/$1/gi;
+if(!-d $rootUrl){
+  print $rootUrl ."\n";
+  testFailed("Extract root Url");
+  exit 1;
+}
+
+my $cdbUrl = getInstallationConfigCdb($structUrl);
+my ($refOptions, $refErrors) = loadCDB($cdbUrl);
+my %cdbOptions = %{$refOptions};
+my %cdbErrors = %{$refErrors};
+if(scalar(keys(%cdbErrors))){
+  if($verbose > 0){
+    testFailed("Load CDB");
+  }
+  if($verbose > 1){
+    print "Errors while parsing ". $cdbUrl .":\n";
+    my @lines = sort { $a <=> $b } keys(%cdbErrors);
+    my $max = length($lines[scalar(@lines) - 1]);
+    foreach my $line (@lines){
+      printColored(sprintf("%". $max ."s", $line) .": ". $cdbErrors{$line} ."\n", "red");
+    }
+  }
+  exit 1;
+}
+
+# find files
+find(\&findUrls, $rootUrl);
+if(!-e $zipUrl){
+  testFailed("Found help archive");
+  exit 1;
+}
+if(!-e $tocUrl){
+  testFailed("Found help tco");
+}
+
+my $zip;
+# catch file not exists error before Zip->new(), because Zip->new() gives ugly error messages
+$zip = Archive::Zip->new($zipUrl);
+if(!defined($zip)){
+  testFailed("Load help archive");
+  exit 1;
+}
+else{
+  testPassed("Load help archive");
+}
+
+# extract info for every option
+my %optionInfos = ();
+my %optionValues = ();
+my %optionDefaults = ();
+my @toc;
+if(tie(@toc, 'Tie::File', $tocUrl)){
+  testPassed("Open TOC");
+  # the linebreak is needed to uncolor Term::ProgressBar
+  print "\n";
+}
+else{
+  testFailed("Open TOC");
+  if($verbose > 0){
+    print "TOC Url: ". $tocUrl ."\n";
+  }
+  exit 1;
+}
+# enabling autoflush to print parse status
+my $lines = scalar(@toc);
+my $progress = Term::ProgressBar->new({name => "Collecting infos", count => $lines});
+$progress->minor(0);
+my $i = 0;
+my %errors = ();
+my $foundOptionsInHelp = 0;
+foreach my $line (@toc){
+  my $line = strip($line);
+  if($line =~ m/label=\"([^\"]+)\" path=\"([^(?:\"|#)]+)/){
+    my $opt = uc($1);
+    my $file = $2;
+    # exclude directories, only file paths are used here
+    if($file =~ m/\/$/){
+      next;
+    }
+    # some options exists several times, therefore only use the first entry found
+    # (Last condition)
+    if(exists($cdbOptions{$opt}) && ($file ne "") && (!exists($optionInfos{$opt}))){
+      # option found and file path also not empty
+      my $content = $zip->contents($file);
+      if(!$content){
+        $errors{$opt} = "Could not extract file ". $file;
+        next;
+      }
+      my $htmlTree = HTML::TreeBuilder->new();
+      if(utf8::is_utf8($content)){
+        $content = utf8::decode($content);
+      }
+      $htmlTree->parse($content);
+      # do some cleanup on the tree
+      $htmlTree->eof();
+
+      # first check whether we've got the correct file with help of title
+      my $element = $htmlTree->find('title');
+      if(!$element){
+        $errors{$opt} = "Could not find <title>";
+        next;
+      }
+      $foundOptionsInHelp++;
+      my @contents = $element->content_refs_list();
+      my $title = uc(${$contents[0]});
+      if($title ne $opt){
+        $errors{$opt} = "Title are not matching (Expected: ". $opt .", Got: ". $title .")";
+        next;
+      }
+
+      $element = $htmlTree->look_down("_tag", "div");
+      my @elements = getChildDivs($element);
+      if(scalar(@elements) != 2){
+        if(scalar(@elements) == 3){
+          # fixing those with empty second div
+          if($elements[1]->as_trimmed_text() eq ""){
+            $elements[1] = $elements[2];
+            pop(@elements);
+          }
+          else{
+            $errors{$opt} = "Second div-container of three within the first div container is not empty.";
+            next;
+          }
+        }
+        else{
+          $errors{$opt} = "Wrong number of div-containers within the first div container (Expected: 2, Got: ". scalar(@elements) .")";
+          next;
+        }
+      }
+      # the first div container contains the option name and the second
+      # contains the values and the description
+      @elements = getChildDivs($elements[1]);
+      if(scalar(@elements) < 1){
+        $errors{$opt} = "Wrong number of div-containers within the second div container (Expected: >=1, Got: ". scalar(@elements) .")";
+        next;
+      }
+
+      # get values
+      my @values = ();
+      # the text of the options div (like ansi * , iso)
+      my $text = $elements[0]->as_trimmed_text();
+      my @tmp = split(/,/, $text);
+      foreach my $value (@tmp){
+        # if we have replaced a *, this is the default value,
+        # because only the default value contains a star
+        if($value =~ s/\*//){
+          $optionDefaults{$opt} = uc(strip($value));
+        }
+        $value = uc(strip($value));
+        push(@values, $value);
+      }
+      $optionValues{$opt} = [ @values ];
+      # check extracted values against those from cdb
+      if(scalar($optionValues{$opt}) == scalar(keys(%{$cdbOptions{$opt}}))){
+        $errors{$opt} = "Found different values for option ". $opt ."(Expected: ". scalar(keys(%{$cdbOptions{$opt}})) .", Got: ". scalar($optionValues{$opt}) .")";
+      }
+
+      # get info (all div after the values div, contains description
+      $optionInfos{$opt} = "";
+      for(my $i = 1; $i < scalar(@elements); $i++){
+        $optionInfos{$opt} .= $elements[$i]->as_trimmed_text() ."\n";
+      }
+      # remove last linebreak
+      $optionInfos{$opt} = strip($optionInfos{$opt});
+      # remove wide characters
+      $optionInfos{$opt} =~ s/[^[:ascii:]]+//g;
+      $htmlTree->delete();
+    }
+  }
+  $i++;
+  $progress->update($i);
+}
+if($i < $lines){
+  $progress->update($lines);
+}
+untie @toc;
+
+if(scalar(keys(%errors)) > 0){
+  print "\n";
+  print2ColsRightAligned("Collecting infos ", scalar(keys(%errors)) ." errors", "yellow");
+  if($verbose > 0){
+    my $max = maxLength(keys(%errors)) + 2;
+    foreach my $opt (sort(keys(%errors))){
+      print sprintf("%-". $max ."s", $opt .": ") . $errors{$opt} ."\n";
+    }
+  }
+}
+
+if($crossfire){
+  # create the output in format of crossfire
+  my $CROSS;
+  if(!open($CROSS, ">", $outputFile)){
+    testFailed("Creating crossfire help");
+    exit 1;
+  }
+
+  # insert header
+  if($structUrl =~ m/^.+((?:creo|proe)[^(?:\\|\/)]+).{0,}/i){
+    print $CROSS "#####################################\n";
+    print $CROSS "#\n";
+    print $CROSS "# For ". $1 ."; Created with CAD::Firemen-". $CAD::Firemen::VERSION ." on ". strftime("%Y-%m-%d", localtime()) ."\n";
+    print $CROSS "#\n";
+    print $CROSS "#####################################\n";
+  }
+
+  # insert all found options into the file
+  # we use cdbOptions here as base, to catch also those options, which we have not found at the documentation
+  my $max = scalar(keys(%cdbOptions));
+  $progress = Term::ProgressBar->new({name => "Inserting data", count => $max});
+  $progress->minor(0);
+  $i = 0;
+  foreach my $opt (sort(keys(%cdbOptions))){
+    # insert option
+    print $CROSS lc($opt) ."\n";
+
+    # insert values
+    my @keys = keys(%{$cdbOptions{$opt}});
+    my $ref = $cdbOptions{$opt}->{$keys[0]};
+    if(!defined($ref)){
+      next;
+    }
+    my @values = ();
+    foreach my $value (keys(%{$ref})){
+      # insert default value hint
+      if(exists($optionDefaults{$opt}) && ($value eq $optionDefaults{$opt})){
+        $value .= " (default)";
+      }
+      push(@values, $value);
+    }
+    print $CROSS join(", ", @values) ."\n";
+
+    # description
+    if(exists($optionInfos{$opt})){
+      print $CROSS $optionInfos{$opt} ."\n"
+    }
+    # option finisher
+    print $CROSS "***\n";
+
+    $i++;
+    $progress->update($i);
+  }
+  if($i < $max){
+    $progress->update($max);
+  }
+  close($CROSS);
+}
+else{
+  # creating the database
+  my $dbh = dbConnect($structUrl, $verbose);
+  if(!$dbh){
+    testFailed("Creating database");
+    exit 1;
+  }
+  # quietly drop the table if it already existed
+  my $errorString = "";
+  my @tables = qw(options options_values options_has_values);
+  foreach my $table (@tables){
+    if(!defined($dbh->do("DROP TABLE IF EXISTS ". $table))){
+      $errorString = "Could not drop table ". $table;
+      last;
+    }
+  }
+  if($errorString ne ""){
+    testFailed("Creating database");
+    if($verbose > 0){
+      print $errorString ."\n";
+    }
+    exit 1;
+  }
+  # (re)create it
+  if(!defined($dbh->do("CREATE TABLE options (id INTEGER PRIMARY KEY, name VARCHAR(250), defaultValueId INTEGER, description TEXT)"))){
+    $errorString = "Could not create the database table options";
+  }
+  if(!defined($dbh->do("CREATE TABLE options_values (id INTEGER PRIMARY KEY, name VARCHAR(250))"))){
+    $errorString = "Could not create the database table options_values";
+  }
+  if(!defined($dbh->do("CREATE TABLE options_has_values (id INTEGER PRIMARY KEY, optionsId INTEGER, valuesId INTEGER)"))){
+    $errorString = "Could not create the database table options_has_values";
+  }
+  if($errorString ne ""){
+    testFailed("Creating database");
+    if($verbose > 0){
+      print $errorString ."\n";
+    }
+    exit 1;
+  }
+
+  # insert all found options into the database
+  # we use cdbOptions here as base, to catch also those options, which we have not found at the documentation
+  my $max = scalar(keys(%cdbOptions));
+  $progress = Term::ProgressBar->new({name => "Inserting data", count => $max});
+  $progress->minor(0);
+  $i = 0;
+  foreach my $opt (sort(keys(%cdbOptions))){
+    my $info = "";
+    if(exists($optionInfos{$opt})){
+      $info = $optionInfos{$opt};
+    }
+    $info = $dbh->quote($info);
+    $dbh->do("INSERT INTO options VALUES (NULL, '". $opt ."', NULL, ". $info .")");
+    my $ref = $dbh->selectall_arrayref("SELECT id FROM options WHERE name='$opt'");
+    if(!defined($ref) || scalar(@{$ref}) != 1){
+      $errorString = "Could not insert option ". $opt ." (Select failed)\nDescription: ". $info;
+      last;
+    }
+    my $optionId = $ref->[0]->[0];
+    if($optionId < 1){
+      $errorString = "Could not insert option ". $opt ." (Id < 1)";
+      last;
+    }
+    my @keys = keys(%{$cdbOptions{$opt}});
+    $ref = $cdbOptions{$opt}->{$keys[0]};
+    if(!defined($ref)){
+      next;
+    }
+    foreach my $value (keys(%{$ref})){
+      # check if value already exists
+      $ref = $dbh->selectall_arrayref("SELECT id FROM options_values WHERE name='$value'");
+      my $valueId = 0;
+      if(defined($ref) && (scalar(@{$ref}) == 1)){
+        $valueId = $ref->[0]->[0];
+      }
+      else{
+        $dbh->do("INSERT INTO options_values VALUES (NULL, '$value')");
+        $ref = $dbh->selectall_arrayref("SELECT id FROM options_values WHERE name='$value'");
+        if(!defined($ref) || scalar(@{$ref}) != 1){
+          $errorString = "Could not insert value ". $value ." of option ". $opt;
+          last;
+        }
+        $valueId = $ref->[0]->[0];
+      }
+      if($valueId < 1){
+        $errorString = "Could not insert value ". $value ." of option ". $opt;
+        last;
+      }
+      # insert the relation and if default value insert defaultId
+      if(!defined($dbh->do("INSERT INTO options_has_values VALUES (NULL, '$optionId', '$valueId')"))){
+        $errorString = "Could not create relation between option ". $opt ." and value ". $value;
+        last;
+      }
+      if(exists($optionDefaults{$opt}) && ($value eq $optionDefaults{$opt})){
+        if(!defined($dbh->do("UPDATE options SET defaultValueId='$valueId' WHERE id='$optionId'"))){
+          $errorString = "Could not update option ". $opt ." to add default value ". $value;
+          last;
+        }
+      }
+    }
+    if($i % 10 == 0){
+      if(!$dbh->commit()){
+        $errorString = "Could not commit changes";
+        last;
+      }
+    }
+    $i++;
+    $progress->update($i);
+  }
+  # finish commit (if at last item $i % 10 is not 0)
+  $dbh->commit();
+  if($i < $max){
+    $progress->update($max);
+  }
+
+  if($errorString ne ""){
+    testFailed("Creating database");
+    if($verbose > 0){
+      print $errorString ."\n";
+    }
+    exit 1;
+  }
+}
+
+# print some statistics
+if($verbose > 0){
+  my $countOptions = scalar(keys(%cdbOptions));
+  # do not count all those options, which have -Fs as value
+  my $ignoredFs = 0;
+  # we use the first entry here, because in CDB file, all options should be
+  # only there one time
+  foreach my $opt (keys(%cdbOptions)){
+    my @keys = keys(%{$cdbOptions{$opt}});
+    foreach my $value (keys(%{$cdbOptions{$opt}->{$keys[0]}})){
+      if($value eq "( -Fs )"){
+        $ignoredFs++;
+        last;
+      }
+    }
+  }
+  my $countOptionsDefaultValues = $countOptions - $ignoredFs;
+
+  print "\n\n";
+  print "Statistics:\n";
+
+  my %statistics = ();
+  $statistics{"Options in cdb"} = buildStatistic("Options in cdb", $countOptions, $countOptions);
+  $statistics{"Options in Help"} = buildStatistic("Options in Help", $foundOptionsInHelp, $countOptions);
+  $statistics{"Default values"} = buildStatistic("Default values", scalar(keys(%optionDefaults)), $countOptionsDefaultValues);
+  $statistics{"Descriptions"} = buildStatistic("Descriptions", scalar(keys(%optionInfos)), $countOptions);
+
+  my $maxLen = maxLength(keys(%statistics)) + 2;
+  foreach my $stat (keys(%statistics)){
+    print sprintf("%-". $maxLen ."s", $stat) . $statistics{$stat} ."\n";
+  }
+  print "Ignored ". $ignoredFs ." Options with value -Fs to calculate percentage of Default values\n";
+}
+
+exit 0;
+__END__
+=pod
+
+=head1 NAME
+
+fm_create_help - Walks through an installation and tries to extract all options with informations into a database
+
+=head1 VERSION
+
+version 0.5.0
+
+=head1 SYNOPSIS
+
+fm_create_help [options] [PATH_TO_INSTALLATION]
+
+Options:
+
+  --help             -h   Prints this help.
+  --version               Prints current version.
+  --verbose          -v   The verbose level. 0 - least output, 2 most output (Default: 0).
+  --output           -o   Optional filepath to store the created data.
+  --locale           -l   The locale which should be used (Default en_US).
+  --crossfire        -c   Store the output in the format of Crossfire. Set file with --output.
+
+If no PATH_TO_INSTALLATION is given, it tries to figure out the correct path with help of $ENV{PATH}.
+
+Example:
+
+  fm_create_help
+
+=head1 DESCRIPTION
+
+This script parses a option database (cdb file) and afterwards, it tries
+to collect more information with help of the delivered html help. The collected
+data is stored in an SQLite Database afterwards. The structure is as shown below.
+
+                                                    |==========================|
+                                                    | options_has_values       |
+                                                    |==========================|
+  |==========================|                      | id INTEGER, PRIMARY KEY  |
+  | options                  |                      |--------------------------|
+  |==========================|          |---------->| optionsId INTEGER        |
+  | id INTEGER, PRIMARY KEY  | ---------|           |--------------------------|
+  |--------------------------|                |---->| valuesId INTEGER         |
+  | name VARCHAR(250)        |                |     |==========================|
+  |--------------------------|                |
+  | defaultValueId INTEGER   |<---------------|
+  |--------------------------|                |     |==========================|
+  | description TEXT         |                |     | options_values           |
+  |==========================|                |     |==========================|
+                                              ------| id INTEGER, PRIMARY KEY  |
+                                                    |--------------------------|
+                                                    | name VARCHAR(250)        |
+                                                    |==========================|
+
+=head1 AUTHOR
+
+Joachim Langenbach <langenbach@imw.tu-clausthal.de>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2011 by TU Clausthal, Institut fuer Maschinenwesen.
+
+This is free software, licensed under:
+
+  The GNU General Public License, Version 2, June 1991
+
+=cut
+

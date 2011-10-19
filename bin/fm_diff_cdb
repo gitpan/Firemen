@@ -1,0 +1,372 @@
+#!/usr/bin/perl
+######################
+#
+#    Copyright (C) 2011  TU Clausthal, Institut für Maschinenwesen, Joachim Langenbach
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+######################
+
+# Pod::Weaver infos
+# PODNAME: fm_diff_cdb
+# ABSTRACT: Analyzes and displays the differences between two cdb files.
+
+use strict;
+use POSIX;
+use warnings;
+use Getopt::Long;
+use CAD::Firemen;
+use CAD::Firemen::Common qw(:PRINTING getInstallationPath getInstallationConfigCdb dbConnect);
+use CAD::Firemen::Load qw(loadCDB loadDatabase);
+use CAD::Firemen::Analyze qw(compare);
+use CAD::Firemen::Change;
+
+
+sub help{
+  print "Usage: fm_diff_cdb  [options] [PATH_TO_OLD_CONFIG.CDB] [PATH_TO_NEW_CONFIG.CDB]\n";#
+  print "\n";
+  print "This script compares two given CDB files and prints out the added and removed options.\n";
+  print "\n";
+  print " --help        -h  Prints this help.\n";
+  print " --version         Prints current version.\n";
+  print " --vernose     -v  Verbose level. 0 - least output, 2 most output\n";
+  print " --added       -a  Print added options (Regardless of verbose level)\n";
+  print " --removed     -r  Print removed options (Regardless of verbose level)\n";
+  print " --changed     -c  Print changed options (Regardless of verbose level)\n";
+  print " --description -d  Displays the description of each printed option.\n";
+  print "                   Only available, if a database can be queried. Thereofe\n";
+  print "                   This options does not need two paths to a CDB file, but two\n";
+  print "                   different installation paths. In this case, you can call it\n";
+  print "                   also without any path\n";
+  print "\n";
+  print "If no first cdb file is given, it tries to figure out the correct installation with help of \$ENV{PATH}.\n";
+}
+
+my $showVersion = 0;
+my $help = 0;
+my $verbose = 0;
+my $printAdded = 0;
+my $printRemoved = 0;
+my $printChanged = 0;
+my $description = 0;
+my $useDatabase = 0;
+my $dbhOld;
+my $dbhNew;
+my %newOptions = ();
+my %oldOptions = ();
+my %removedOptions = ();
+my %addedOptions = ();
+my %changedOptions = ();
+my %duplicatedOptions  = ();
+my %newDescriptions = ();
+my %oldDescriptions = ();
+
+Getopt::Long::Configure ("bundling");
+GetOptions(
+  'version' => \$showVersion,
+  'help|h' => \$help,
+  'verbose|v:i' => \$verbose,
+  'added|a' => \$printAdded,
+  'removed|r' => \$printRemoved,
+  'changed|c' => \$printChanged,
+  'description|d' => \$description
+);
+
+if($help){
+  help();
+  exit 0;
+}
+
+if($showVersion){
+  CAD::Firemen::printVersion();
+}
+
+my $oldUrl = shift;
+my $newUrl = shift;
+
+if(!defined($oldUrl) && (!defined($newUrl))){
+  # running in database mode
+  $oldUrl = getInstallationPath();
+  $newUrl = getInstallationPath();
+  $useDatabase = 1;
+}
+elsif(!defined($newUrl)){
+  $newUrl = $oldUrl;
+  if($description){
+    $oldUrl = getInstallationPath();
+    $useDatabase = 1;
+  }
+  else{
+    $oldUrl = getInstallationConfigCdb();
+  }
+}
+
+if(!defined($oldUrl) || $oldUrl eq ""){
+  help();
+  exit 1;
+}
+
+if(!defined($newUrl) || $newUrl eq ""){
+  help();
+  exit 1;
+}
+
+if($useDatabase){
+  $dbhOld = dbConnect($oldUrl, $verbose);
+  $dbhNew = dbConnect($newUrl, $verbose);
+  if(!defined($dbhOld) || !defined($dbhNew)){
+    help();
+    exit 1;
+  }
+}
+
+if($verbose > 1){
+  if($useDatabase){
+    print "Old database:       ". $dbhOld->{Name} ."\n";
+    print "New database:       ". $dbhNew->{Name} ."\n";
+  }
+  else{
+    print "Old CDB File:       ". $oldUrl ."\n";
+    print "New CDB File:       ". $oldUrl ."\n";
+  }
+}
+
+if($useDatabase){
+  my ($ref1, $ref2, $ref3) = loadDatabase($dbhOld, "SELECT * FROM options", $verbose);
+  %oldOptions = %{$ref1};
+  my %errors1 = %{$ref2};
+  %oldDescriptions = %{$ref3};
+  ($ref1, $ref2, $ref3) = loadDatabase($dbhNew, "SELECT * FROM options", $verbose);
+  %newOptions = %{$ref1};
+  my %errors2 = %{$ref2};
+  %newDescriptions = %{$ref3};
+
+  if(scalar(keys(%errors1))){
+    testFailed("Load first database");
+    if($verbose > 0){
+      print "Errors while loading ". $dbhOld->{Name} .":\n";
+      my @lines = sort { $a <=> $b } keys(%errors1);
+      my $max = length($lines[scalar(@lines) - 1]);
+      foreach my $line (@lines){
+        printColored(sprintf("%". $max ."s", $line) .": ". $errors1{$line} ."\n", "red");
+      }
+    }
+    exit 1;
+  }
+  if(scalar(keys(%errors2))){
+    testFailed("Load second database");
+    if($verbose > 0){
+      print "Errors while loading ". $dbhNew->{Name} .":\n";
+      my @lines = sort { $a <=> $b } keys(%errors2);
+      my $max = length($lines[scalar(@lines) - 1]);
+      foreach my $line (@lines){
+        printColored(sprintf("%". $max ."s", $line) .": ". $errors2{$line} ."\n", "red");
+      }
+    }
+    exit 1;
+  }
+  print2ColsRightAligned("Found old options in ". $dbhOld->{Name},  scalar(keys(%oldOptions)), "green");
+  print2ColsRightAligned("Found new options in ". $dbhNew->{Name},  scalar(keys(%newOptions)), "green");
+}
+else{
+  my ($ref1, $ref2) = loadCDB($oldUrl, $verbose);
+  %oldOptions = %{$ref1};
+  my %errors1 = %{$ref2};
+  ($ref1, $ref2) = loadCDB($newUrl, $verbose);
+  %newOptions = %{$ref1};
+  my %errors2 = %{$ref2};
+
+  if(scalar(keys(%errors1))){
+    testFailed("Load first CDB");
+    if($verbose > 0){
+      print "Errors while parsing ". $oldUrl .":\n";
+      my @lines = sort { $a <=> $b } keys(%errors1);
+      my $max = length($lines[scalar(@lines) - 1]);
+      foreach my $line (@lines){
+        printColored(sprintf("%". $max ."s", $line) .": ". $errors1{$line} ."\n", "red");
+      }
+    }
+    exit 1;
+  }
+  if(scalar(keys(%errors2))){
+    testFailed("Load second CDB");
+    if($verbose > 0){
+      print "Errors while parsing ". $newUrl .":\n";
+      my @lines = sort { $a <=> $b } keys(%errors2);
+      my $max = length($lines[scalar(@lines) - 1]);
+      foreach my $line (@lines){
+        printColored(sprintf("%". $max ."s", $line) .": ". $errors2{$line} ."\n", "red");
+      }
+    }
+    exit 1;
+  }
+  print2ColsRightAligned("Found old options in ". $oldUrl,  scalar(keys(%oldOptions)), "green");
+  print2ColsRightAligned("Found new options in ". $newUrl,  scalar(keys(%newOptions)), "green");
+}
+
+if($verbose > 1){
+  foreach my $key (sort(keys(%oldOptions))){
+    print $key ."\n";
+    foreach my $param (@{$oldOptions{$key}}){
+      print "   ". $param ."\n";
+    }
+  }
+}
+
+my ($ref1, $ref2, $ref3, $ref4) = compare(\%oldOptions, \%newOptions);
+%addedOptions = %{$ref1};
+%removedOptions = %{$ref3};
+%duplicatedOptions = %{$ref4};
+
+# Analyze changes
+foreach my $opt (keys(%oldOptions)){
+  # just skip removed ones, because they are already handled
+  if(!exists($newOptions{$opt})){
+    next;
+  }
+  # check that all values are the same
+  my $change = new CAD::Firemen::Change("name" => $opt);
+  $change->setPossibleValuesOld([keys(%{$oldOptions{$opt}})]);
+  $change->setPossibleValuesNew([keys(%{$newOptions{$opt}})]);
+  foreach my $value (keys(%{$oldOptions{$opt}})){
+    if($oldOptions{$opt}->{$value}){
+      $change->setDefaultValueOld($value);
+    }
+  }
+  foreach my $value (keys(%{$newOptions{$opt}})){
+    if($newOptions{$opt}->{$value}){
+      $change->setDefaultValueNew($value);
+    }
+  }
+  $change->evalChange();
+  if($change->changeType(CAD::Firemen::Change::Type->ValuesChanged) || $change->changeType(CAD::Firemen::Change::Type->DefaultValueChanged)){
+    $changedOptions{$opt} = $change;
+  }
+}
+
+print2ColsRightAligned("Duplicates", scalar(keys(%duplicatedOptions)));
+if($verbose > 0 || $printAdded || $printChanged ||$printRemoved){
+  my $max = maxLength(keys(%duplicatedOptions)) + 2;
+  foreach my $opt (sort(keys(%duplicatedOptions))){
+    printColored(sprintf("%-". $max ."s", $opt) ." ". $duplicatedOptions{$opt} ."\n", "red");
+    if($description && exists($newDescriptions{$opt})){
+      printBlock($newDescriptions{$opt}, 3);
+    }
+  }
+}
+
+# print out the results
+print2ColsRightAligned("Removed", scalar(keys(%removedOptions)));
+if(($verbose > 0) || $printRemoved){
+  foreach my $option (sort(keys(%removedOptions))){
+    printColored($option ."\n", "RED");
+    if($description && exists($oldDescriptions{$option})){
+      printBlock($oldDescriptions{$option}, 3);
+    }
+  }
+}
+
+# print out the results
+print2ColsRightAligned("Added", scalar(keys(%addedOptions)));
+if(($verbose > 0) || $printAdded){
+  foreach my $option (sort(keys(%addedOptions))){
+    printColored($option ."\n", "GREEN");
+    if($description && exists($newDescriptions{$option})){
+      printBlock($newDescriptions{$option}, 3);
+    }
+  }
+}
+
+# print out the results
+print2ColsRightAligned("Changed", scalar(keys(%changedOptions)));
+if(($verbose > 0) || $printChanged){
+  my $max = maxLength(keys(%changedOptions)) + 2;
+  my $indentRegex = "\n". sprintf("%". $max ."s", "");
+  foreach my $option (sort(keys(%changedOptions))){
+    my $info = $changedOptions{$option}->changeDescription();
+    $info =~ s/\n/$indentRegex/gs;
+    printColored(sprintf("%-". $max ."s", $option .": "), "YELLOW");
+    print $info ."\n";
+    if($description){
+      if(exists($newDescriptions{$option})){
+        printBlock($newDescriptions{$option}, 3);
+      }
+      elsif(exists($oldDescriptions{$option})){
+        printBlock($newDescriptions{$option}, 3);
+      }
+    }
+  }
+}
+
+exit 0;
+__END__
+=pod
+
+=head1 NAME
+
+fm_diff_cdb - Analyzes and displays the differences between two cdb files.
+
+=head1 VERSION
+
+version 0.5.0
+
+=head1 SYNOPSIS
+
+fm_diff_cdb [options] [PATH_TO_OLD_CONFIG.CDB] PATH_TO_NEW_CONFIG.CDB
+
+Options:
+
+  --help             -h  Prints this help.
+  --version              Prints current version.
+  --verbose          -v  The verbose level. 0 - least output, 2 most output (Default: 0).
+  --added            -a  Print added options (Regardless of verbose level).
+  --removed          -r  Print removed options (Regardless of verbose level).
+  --changed          -c  Print changed options (Regardless of verbose level)
+  --description      -d  Displays the description of each printed option. Thereofe
+                         This options does not need two paths to a CDB file, but two
+                         different installation paths. In this case, you can call it
+                         also without any path
+
+If no first cdb file is given, it tries to figure out the correct installation with help of $ENV{PATH}.
+
+Example:
+
+  fm_diff_cdb -ar c:\proeWildfire4\text\config.cdb c:\proeWildfire5\text\config.cdb
+
+Or to use databases:
+
+  fm_diff_cdb
+
+Or
+
+  fm_diff_cdb -d
+
+Or
+
+  fm_diff_cdb -d c:\proeWildfire4 c:\proeWildfire5
+
+=head1 AUTHOR
+
+Joachim Langenbach <langenbach@imw.tu-clausthal.de>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2011 by TU Clausthal, Institut fuer Maschinenwesen.
+
+This is free software, licensed under:
+
+  The GNU General Public License, Version 2, June 1991
+
+=cut
+

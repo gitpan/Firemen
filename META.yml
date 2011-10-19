@@ -1,0 +1,43 @@
+---
+abstract: 'Scripts and Modules to manage PTC(R) Pro/Engineer(R) / Creo(TM) configurations. Use perldoc Firemen to get an introduction to the usage of this distribution.'
+author:
+  - 'Joachim Langenbach <langenbach@imw.tu-clausthal.de>'
+build_requires:
+  English: 0
+  File::Basename: 0
+  File::Temp: 0
+  FindBin: 0
+  Test::More: 0
+  perl: 5.006
+configure_requires:
+  ExtUtils::MakeMaker: 6.30
+dynamic_config: 0
+generated_by: 'Dist::Zilla version 4.200015, CPAN::Meta::Converter version 2.110930'
+license: gpl
+meta-spec:
+  url: http://module-build.sourceforge.net/META-spec-v1.4.html
+  version: 1.4
+name: Firemen
+requires:
+  Archive::Zip: 0
+  DBI: 0
+  Digest::MD5: 0
+  Exporter: 0
+  File::Copy: 0
+  File::Copy::Recursive: 0
+  File::Find: 0
+  File::Path: 0
+  File::Spec: 0
+  Getopt::Long: 0
+  HTML::TreeBuilder: 0
+  POSIX: 0
+  Term::ANSIColor: 0
+  Term::ProgressBar: 0
+  Term::ReadKey: 0
+  Tie::File: 0
+  Win32: 0
+  Win32::Console::ANSI: 0
+  Win32::Shortcut: 0
+  YAML::XS: 0
+  constant: 0
+version: 0.5.0
